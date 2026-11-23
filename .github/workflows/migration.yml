@@ -152,6 +152,9 @@ jobs:
           # Подставляем пароли в шаблон средствами bash (без вывода в лог)
           umask 077
           TPL="$(cat migration/migration.load.template)"
+          # На Windows git превращает переводы строк в CRLF: символ \r попадает
+          # в имя базы ("mattermost\r"), и pgloader не находит ни одной таблицы
+          TPL="${TPL//$'\r'/}"
           TPL="${TPL//__MYSQL_ROOT_PASSWORD__/$MYSQL_ROOT_PASSWORD}"
           TPL="${TPL//__POSTGRES_PASSWORD__/$POSTGRES_PASSWORD}"
           printf '%s\n' "$TPL" > "$WORKDIR/migration.load"
@@ -162,6 +165,13 @@ jobs:
             -v "$WORKDIR:/home/migration" \
             mattermost/mattermost-pgloader:latest \
             pgloader /home/migration/migration.load
+
+          TABLES=$(docker exec mattermost-postgres psql -U mmuser -d mattermost -tAc \
+                   "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'")
+          echo "ℹ️ Tables in PostgreSQL public schema: $TABLES"
+          if [ "${TABLES:-0}" -eq 0 ]; then
+            echo "❌ pgloader did not create any tables"; exit 1
+          fi
 
       # 6. Проверка, что данные действительно перенесены (сравнение количества строк)
       - name: Verify migrated data
