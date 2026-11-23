@@ -21,7 +21,10 @@ env:
 
 defaults:
   run:
-    shell: bash   # на Windows-раннере — Git Bash (иначе по умолчанию PowerShell)
+    # Windows-раннер: явно указываем Git Bash. Просто "bash" находит
+    # C:\Windows\System32\bash.exe (WSL), который не видит пути Windows.
+    # PROGRA~1 — короткое имя "C:\Program Files" (путь без пробелов).
+    shell: C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
 
 jobs:
   migrate-and-deploy:
