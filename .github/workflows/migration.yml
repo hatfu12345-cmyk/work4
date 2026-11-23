@@ -213,10 +213,14 @@ jobs:
           echo "🧪 Running Smoke Tests..."
           echo "⏳ Waiting for Mattermost to apply internal database migrations (up to 5 min)..."
           for i in $(seq 1 60); do
-            CODE=$(curl -s -o /tmp/ping.json -w '%{http_code}' http://localhost:8065/api/v4/system/ping || true)
-            if [ "$CODE" = "200" ] && grep -q '"status":"OK"' /tmp/ping.json; then
+            # Ответ держим в переменной, а не в /tmp: на Windows curl.exe и bash
+            # понимают путь /tmp по-разному (файл писался в одно место, читался из другого)
+            RESP=$(curl -s -w '\n%{http_code}' http://localhost:8065/api/v4/system/ping || true)
+            CODE="${RESP##*$'\n'}"
+            BODY="${RESP%$'\n'*}"
+            if [ "$CODE" = "200" ] && [[ "$BODY" == *'"status":"OK"'* ]]; then
               echo "✅ HTTP $CODE — Mattermost upgraded successfully and running on Postgres!"
-              VERSION=$(curl -s -D - -o /dev/null http://localhost:8065/api/v4/system/ping | grep -i '^x-version-id' || true)
+              VERSION=$(curl -s -i http://localhost:8065/api/v4/system/ping | tr -d '\r' | grep -i '^x-version-id' || true)
               echo "ℹ️ $VERSION"
               POSTS=$(docker exec mattermost-postgres psql -U mmuser -d mattermost -tAc \
                       "SELECT COUNT(*) FROM posts WHERE deleteat = 0")
