@@ -12,9 +12,16 @@ concurrency:
 
 env:
   COMPOSE_FILE: docker-compose.prod.yml
+  # Раннер на Windows: шаги выполняются в Git Bash. Отключаем автоматическую
+  # подмену путей вида /home/... на C:/Program Files/Git/home/...
+  MSYS_NO_PATHCONV: "1"
   # Пароли — только из GitHub Secrets. GitHub автоматически маскирует их в логах (***)
   POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
   MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
+
+defaults:
+  run:
+    shell: bash   # на Windows-раннере — Git Bash (иначе по умолчанию PowerShell)
 
 jobs:
   migrate-and-deploy:
@@ -80,7 +87,7 @@ jobs:
             mysqldump -uroot --single-transaction --routines --triggers mattermost \
             | gzip > "$BACKUP_FILE"
 
-          if [ ! -s "$BACKUP_FILE" ] || ! zcat "$BACKUP_FILE" | grep -q "CREATE TABLE"; then
+          if [ ! -s "$BACKUP_FILE" ] || ! gzip -dc "$BACKUP_FILE" | grep -q "CREATE TABLE"; then
             echo "❌ Backup is empty or broken"
             exit 1
           fi
