@@ -1,0 +1,71 @@
+# docker-compose.prod.yml
+# Целевой (production) стек: Mattermost v12.0.1 + PostgreSQL 15
+#
+# name: legacy — то же имя compose-проекта, что у стека в папке legacy/.
+#   Без этого: (1) конфликт имени контейнера "mattermost" — он уже занят старым
+#   стеком; (2) --remove-orphans не тронет mattermost-mysql, потому что тот
+#   принадлежит другому проекту. С общим именем контейнер mattermost
+#   пересоздаётся на новой версии, а mattermost-mysql удаляется как «сирота».
+#
+# Том legacy_mattermost_data — ТОТ ЖЕ, что в legacy (external): вложения и
+#   аватары сохраняются. Оба образа team-edition работают от UID 2000,
+#   поэтому Permission denied после обновления не возникает.
+#
+# POSTGRES_PASSWORD приходит из окружения: в пайплайне — из GitHub Secret
+#   DB_POSTGRES_PASSWORD. В YAML паролей нет.
+name: legacy
+
+services:
+  mattermost:
+    image: mattermost/mattermost-team-edition:12.0.1
+    container_name: mattermost
+    ports:
+      - "8065:8065"
+    environment:
+      - MM_SQLSETTINGS_DRIVERNAME=postgres
+      - MM_SQLSETTINGS_DATASOURCE=postgres://mmuser:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set}@mattermost-postgres:5432/mattermost?sslmode=disable&connect_timeout=10
+      - MM_SERVICESETTINGS_SITEURL=http://localhost:8065
+      - MM_TEAMSETTINGS_ENABLEOPENSERVER=false
+    volumes:
+      - mattermost_data:/mattermost/data
+      - mattermost_logs:/mattermost/logs
+    networks:
+      - mattermost_network
+    depends_on:
+      mattermost-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mattermost-postgres:
+    image: postgres:15-alpine
+    container_name: mattermost-postgres
+    environment:
+      - POSTGRES_USER=mmuser
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set}
+      - POSTGRES_DB=mattermost
+      - TZ=UTC
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mmuser -d mattermost"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - mattermost_network
+    restart: unless-stopped
+
+networks:
+  mattermost_network:
+    name: mattermost_network
+    driver: bridge
+
+volumes:
+  mattermost_data:
+    name: legacy_mattermost_data
+    external: true
+  mattermost_logs:
+    name: legacy_mattermost_logs
+    external: true
+  postgres_data:
+    name: legacy_postgres_data

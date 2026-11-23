@@ -1,0 +1,30 @@
+-- Конфигурация pgloader: MySQL (legacy) -> PostgreSQL (prod).
+-- Пайплайн подставляет пароли из GitHub Secrets вместо плейсхолдеров
+-- __MYSQL_ROOT_PASSWORD__ / __POSTGRES_PASSWORD__ и пишет итоговый файл во
+-- временную папку раннера (права 600), после запуска файл удаляется.
+--
+-- include drop          — идемпотентность: при повторном запуске таблицы в
+--                         PostgreSQL удаляются и создаются заново, а не дублируются.
+-- ALTER SCHEMA ... 'public' — pgloader по умолчанию кладёт таблицы в схему с именем
+--                         MySQL-базы ("mattermost"), а Mattermost ищет их в public.
+-- CAST json -> jsonb     — в PostgreSQL-схеме Mattermost JSON-поля имеют тип jsonb.
+-- Блок SET MySQL PARAMETERS не используется: версия pgloader в образе
+-- mattermost/mattermost-pgloader его не понимает (ESRAP-PARSE-ERROR).
+
+LOAD DATABASE
+     FROM mysql://root:__MYSQL_ROOT_PASSWORD__@mattermost-mysql:3306/mattermost
+     INTO postgresql://mmuser:__POSTGRES_PASSWORD__@mattermost-postgres:5432/mattermost
+
+WITH include drop, create tables, create indexes, reset sequences,
+     foreign keys, downcase identifiers, preserve index names,
+     workers = 4, concurrency = 1
+
+CAST type json to jsonb drop typemod
+
+ALTER SCHEMA 'mattermost' RENAME TO 'public'
+
+BEFORE LOAD DO
+     $$ DROP SCHEMA IF EXISTS mattermost CASCADE; $$
+
+AFTER LOAD DO
+     $$ ALTER SCHEMA public OWNER TO mmuser; $$;

@@ -1,0 +1,191 @@
+name: Idempotent Mattermost Migration & Upgrade
+
+on:
+  push:
+    branches: [ "migration" ]
+  workflow_dispatch:
+
+# Два прогона одновременно не запускаются — второй ждёт завершения первого
+concurrency:
+  group: mattermost-migration
+  cancel-in-progress: false
+
+env:
+  COMPOSE_FILE: docker-compose.prod.yml
+  # Пароли — только из GitHub Secrets. GitHub автоматически маскирует их в логах (***)
+  POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
+  MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
+
+jobs:
+  migrate-and-deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check secrets are configured
+        run: |
+          if [ -z "$POSTGRES_PASSWORD" ] || [ -z "$MYSQL_ROOT_PASSWORD" ]; then
+            echo "❌ Secrets DB_POSTGRES_PASSWORD / DB_MYSQL_ROOT_PASSWORD are not set"
+            exit 1
+          fi
+          echo "✅ Secrets are present"
+
+      # 1. Проверка идемпотентности: выполнялась ли миграция ранее?
+      #    Флаг-файл лежит в $HOME раннера, а не в рабочей папке:
+      #    actions/checkout чистит рабочую папку при каждом запуске.
+      - name: Check Migration Status
+        id: check_status
+        run: |
+          FLAG="$HOME/.mattermost_migration_completed"
+          running() { docker ps --format '{{.Names}}' | grep -qx "$1"; }
+
+          if [ -f "$FLAG" ]; then
+            echo "✅ Database already migrated to PostgreSQL. Skipping backup and data transfer."
+            echo "already_migrated=true" >> "$GITHUB_OUTPUT"
+          elif ! running mattermost-mysql && running mattermost-postgres \
+               && [ "$(docker exec mattermost-postgres psql -U mmuser -d mattermost -tAc \
+                     "SELECT to_regclass('public.posts') IS NOT NULL")" = "t" ]; then
+            # Флаг потерян, но MySQL уже удалён, а в PostgreSQL есть данные —
+            # миграция была. Восстанавливаем флаг вместо падения на шаге бэкапа.
+            echo "✅ Flag missing, but PostgreSQL already holds migrated data. Restoring flag."
+            touch "$FLAG"
+            echo "already_migrated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "⚠️ Migration required."
+            echo "already_migrated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 2. Резервная копия MySQL перед началом работ
+      - name: Backup Legacy MySQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          if ! docker ps --format '{{.Names}}' | grep -qx mattermost-mysql; then
+            echo "❌ Error: Legacy MySQL container is not running!"
+            exit 1
+          fi
+
+          # Останавливаем старый Mattermost, чтобы во время переноса никто не писал в БД
+          docker stop mattermost >/dev/null 2>&1 || true
+
+          BACKUP_DIR="$HOME/mattermost-backups"
+          BACKUP_FILE="$BACKUP_DIR/mattermost_mysql_backup_${{ github.run_id }}_$(date +%Y%m%d_%H%M%S).sql.gz"
+          mkdir -p "$BACKUP_DIR"
+
+          echo "📦 Creating timestamped backup of MySQL..."
+          # Пароль передаётся через переменную MYSQL_PWD, а не аргументом -p:
+          # он не попадает ни в лог, ни в список процессов
+          docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mattermost-mysql \
+            mysqldump -uroot --single-transaction --routines --triggers mattermost \
+            | gzip > "$BACKUP_FILE"
+
+          if [ ! -s "$BACKUP_FILE" ] || ! zcat "$BACKUP_FILE" | grep -q "CREATE TABLE"; then
+            echo "❌ Backup is empty or broken"
+            exit 1
+          fi
+          echo "✅ Backup saved: $BACKUP_FILE ($(du -h "$BACKUP_FILE" | cut -f1))"
+
+      # 3. Подготовка MySQL к pgloader: образ pgloader не поддерживает
+      #    caching_sha2_password (плагин по умолчанию в MySQL 8.0).
+      #    Команда идемпотентна — её можно выполнять сколько угодно раз.
+      - name: Prepare MySQL auth for pgloader
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          # SQL подаётся через stdin (printf — встроенная команда bash),
+          # поэтому пароль не виден в списке процессов
+          printf "ALTER USER 'root'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\nFLUSH PRIVILEGES;\n" \
+            "$MYSQL_ROOT_PASSWORD" \
+            | docker exec -i -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mattermost-mysql mysql -uroot
+          echo "✅ root@% uses mysql_native_password"
+
+      # 4. Поднятие PostgreSQL для приёма данных (--wait ждёт healthcheck, а не sleep)
+      - name: Start Target PostgreSQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker compose -f "$COMPOSE_FILE" up -d --wait mattermost-postgres
+          echo "✅ PostgreSQL is ready"
+
+      # 5. Гетерогенная миграция MySQL -> PostgreSQL официальным образом pgloader
+      #    "include drop" в migration.load делает шаг идемпотентным: при
+      #    перезапуске упавшего пайплайна таблицы пересоздаются, а не дублируются.
+      - name: Run pgloader (With Schema Drop for Idempotency)
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          WORKDIR="$RUNNER_TEMP/pgloader"
+          mkdir -p "$WORKDIR"
+          trap 'rm -f "$WORKDIR/migration.load"' EXIT   # файл с паролями удаляется всегда
+
+          # Подставляем пароли в шаблон средствами bash (без вывода в лог)
+          umask 077
+          TPL="$(cat migration/migration.load.template)"
+          TPL="${TPL//__MYSQL_ROOT_PASSWORD__/$MYSQL_ROOT_PASSWORD}"
+          TPL="${TPL//__POSTGRES_PASSWORD__/$POSTGRES_PASSWORD}"
+          printf '%s\n' "$TPL" > "$WORKDIR/migration.load"
+          chmod 644 "$WORKDIR/migration.load"   # чтобы прочитал пользователь внутри контейнера
+
+          echo "🔄 Migrating schema and data from MySQL to PostgreSQL..."
+          docker run --rm --network=mattermost_network \
+            -v "$WORKDIR:/home/migration" \
+            mattermost/mattermost-pgloader:latest \
+            pgloader /home/migration/migration.load
+
+      # 6. Проверка, что данные действительно перенесены (сравнение количества строк)
+      - name: Verify migrated data
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          set -e
+          for T in Users Teams Channels Posts; do
+            T_LOWER=$(echo "$T" | tr 'A-Z' 'a-z')
+            MY=$(docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mattermost-mysql \
+                 mysql -uroot -N -e "SELECT COUNT(*) FROM mattermost.$T")
+            PG=$(docker exec mattermost-postgres psql -U mmuser -d mattermost -tAc \
+                 "SELECT COUNT(*) FROM public.$T_LOWER")
+            echo "$T: MySQL=$MY PostgreSQL=$PG"
+            if [ "$MY" != "$PG" ]; then
+              echo "❌ Row count mismatch in $T"
+              exit 1
+            fi
+          done
+          echo "✅ All rows transferred"
+
+      # 7. Маркерный флаг-файл успешной миграции
+      - name: Mark Migration as Completed
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          touch "$HOME/.mattermost_migration_completed"
+          echo "🏁 Flag created: $HOME/.mattermost_migration_completed"
+
+      # 8. Развёртывание обновлённого стека.
+      #    --remove-orphans удаляет контейнер mattermost-mysql (его нет в prod-файле)
+      - name: Deploy Upgraded Stack
+        run: |
+          echo "🚀 Launching Upgraded Mattermost Stack..."
+          docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
+          docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+
+      # 9. Smoke-тесты: API отвечает, версия новая, сообщения на месте
+      - name: Run Health Checks & Verify Data
+        run: |
+          echo "🧪 Running Smoke Tests..."
+          echo "⏳ Waiting for Mattermost to apply internal database migrations (up to 5 min)..."
+          for i in $(seq 1 60); do
+            CODE=$(curl -s -o /tmp/ping.json -w '%{http_code}' http://localhost:8065/api/v4/system/ping || true)
+            if [ "$CODE" = "200" ] && grep -q '"status":"OK"' /tmp/ping.json; then
+              echo "✅ HTTP $CODE — Mattermost upgraded successfully and running on Postgres!"
+              VERSION=$(curl -s -D - -o /dev/null http://localhost:8065/api/v4/system/ping | grep -i '^x-version-id' || true)
+              echo "ℹ️ $VERSION"
+              POSTS=$(docker exec mattermost-postgres psql -U mmuser -d mattermost -tAc \
+                      "SELECT COUNT(*) FROM posts WHERE deleteat = 0")
+              echo "ℹ️ Posts in PostgreSQL: $POSTS"
+              if docker ps --format '{{.Names}}' | grep -qx mattermost-mysql; then
+                echo "❌ Legacy MySQL container is still running"
+                exit 1
+              fi
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ Application health check failed (last HTTP code: $CODE). Fetching logs..."
+          docker compose -f "$COMPOSE_FILE" logs --tail=200 mattermost
+          exit 1

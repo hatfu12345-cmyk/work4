@@ -1,0 +1,66 @@
+name: Idempotent Mattermost Migration & Upgrade
+on:
+  push:
+    branches: [ "migration" ]
+  workflow_dispatch:
+
+env:
+  COMPOSE_FILE: docker-compose.prod.yml
+
+jobs:
+  migrate-and-deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check Migration Status
+        id: check_status
+        shell: powershell
+        run: |
+          if (Test-Path "C:\actions-runner\mattermost_migration_completed") {
+            "already_migrated=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "already_migrated=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Backup Legacy MySQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        shell: powershell
+        run: docker exec mattermost-mysql mysqldump -u root -pMM_ROOT_PASSWORD mattermost > backup.sql
+
+      - name: Start Target PostgreSQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        shell: powershell
+        run: |
+          docker compose -f $env:COMPOSE_FILE up -d mattermost-postgres
+          Start-Sleep -Seconds 10
+
+      - name: Run pgloader
+        if: steps.check_status.outputs.already_migrated == 'false'
+        shell: powershell
+        run: docker run --rm --network=mattermost_network mattermost/mattermost-pgloader:latest pgloader --with "include drop" --with "create tables" mysql://root:MM_ROOT_PASSWORD@mattermost-mysql:3306/mattermost postgresql://mmuser:MM_PG_PASSWORD@mattermost-postgres:5432/mattermost
+
+      - name: Mark Migration as Completed
+        if: steps.check_status.outputs.already_migrated == 'false'
+        shell: powershell
+        run: New-Item -Path "C:\actions-runner\mattermost_migration_completed" -ItemType File -Force
+
+      - name: Deploy Upgraded Stack
+        shell: powershell
+        run: |
+          docker rm -f mattermost-mysql 2>$null
+          docker rm -f mattermost 2>$null
+          docker compose -f $env:COMPOSE_FILE up -d --remove-orphans
+          Start-Sleep -Seconds 30
+
+      - name: Run Health Checks
+        shell: powershell
+        run: |
+          try {
+            Invoke-WebRequest -Uri "http://localhost:8065/api/v4/system/ping" -UseBasicParsing | Out-Null
+            Write-Host "Mattermost is up!"
+          } catch {
+            Write-Host "Health check failed."
+            exit 1
+          }

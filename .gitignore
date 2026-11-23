@@ -1,0 +1,5 @@
+.env
+legacy/.env
+*.sql
+*.sql.gz
+migration/migration.load
