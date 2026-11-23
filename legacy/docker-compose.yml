@@ -33,7 +33,9 @@ services:
       - MYSQL_USER=mmuser
       - MYSQL_PASSWORD=${MYSQL_PASSWORD}
       - TZ=UTC
-    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_general_ci"]
+    # mysql_native_password: pgloader не поддерживает caching_sha2_password
+    # (плагин MySQL 8.0 по умолчанию) — без этого флага он не подключится
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_general_ci", "--default-authentication-plugin=mysql_native_password"]
     volumes:
       - mysql_data:/var/lib/mysql
     networks:
