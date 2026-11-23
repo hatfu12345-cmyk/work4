@@ -1,13 +1,18 @@
 -- Конфигурация pgloader: MySQL (legacy) -> PostgreSQL (prod).
 -- Пайплайн подставляет пароли из GitHub Secrets вместо плейсхолдеров
 -- __MYSQL_ROOT_PASSWORD__ / __POSTGRES_PASSWORD__ и пишет итоговый файл во
--- временную папку раннера (права 600), после запуска файл удаляется.
+-- временную папку раннера, после запуска файл удаляется.
 --
--- include drop          — идемпотентность: при повторном запуске таблицы в
---                         PostgreSQL удаляются и создаются заново, а не дублируются.
+-- include drop            — идемпотентность: при повторном запуске таблицы в
+--                           PostgreSQL удаляются и создаются заново, а не дублируются.
 -- ALTER SCHEMA ... 'public' — pgloader по умолчанию кладёт таблицы в схему с именем
---                         MySQL-базы ("mattermost"), а Mattermost ищет их в public.
--- CAST json -> jsonb     — в PostgreSQL-схеме Mattermost JSON-поля имеют тип jsonb.
+--                           MySQL-базы ("mattermost"), а Mattermost ищет их в public.
+-- CAST ...                — типы колонок приводятся к тем, что ожидает PostgreSQL-схема
+--                           Mattermost (jsonb и enum-типы), как в официальном шаблоне.
+-- AFTER LOAD UPDATE ... 92 — у миграции №92 в MySQL и PostgreSQL разные имена
+--                           (teammembers / teamembers). Без исправления Mattermost 12
+--                           считает её непримененной и падает с duplicate key
+--                           (это исправление есть и в официальном шаблоне Mattermost).
 -- Блок SET MySQL PARAMETERS не используется: версия pgloader в образе
 -- mattermost/mattermost-pgloader его не понимает (ESRAP-PARSE-ERROR).
 
@@ -19,12 +24,25 @@ WITH include drop, create tables, create indexes, reset sequences,
      foreign keys, downcase identifiers, preserve index names,
      workers = 4, concurrency = 1
 
-CAST type json to jsonb drop typemod
+CAST column Channels.Type to "channel_type" drop typemod,
+     column Teams.Type to "team_type" drop typemod,
+     column UploadSessions.Type to "upload_session_type" drop typemod,
+     column ChannelBookmarks.Type to "channel_bookmark_type" drop typemod,
+     type json to jsonb drop typemod
 
 ALTER SCHEMA 'mattermost' RENAME TO 'public'
 
 BEFORE LOAD DO
-     $$ DROP SCHEMA IF EXISTS mattermost CASCADE; $$
+     $$ DROP SCHEMA IF EXISTS mattermost CASCADE; $$,
+     $$ DROP TYPE IF EXISTS channel_type CASCADE; $$,
+     $$ DROP TYPE IF EXISTS team_type CASCADE; $$,
+     $$ DROP TYPE IF EXISTS upload_session_type CASCADE; $$,
+     $$ DROP TYPE IF EXISTS channel_bookmark_type CASCADE; $$,
+     $$ CREATE TYPE channel_type AS ENUM ('P', 'G', 'O', 'D'); $$,
+     $$ CREATE TYPE team_type AS ENUM ('I', 'O'); $$,
+     $$ CREATE TYPE upload_session_type AS ENUM ('attachment', 'import'); $$,
+     $$ CREATE TYPE channel_bookmark_type AS ENUM ('link', 'file'); $$
 
 AFTER LOAD DO
+     $$ UPDATE public.db_migrations SET name = 'add_createat_to_teamembers' WHERE version = 92; $$,
      $$ ALTER SCHEMA public OWNER TO mmuser; $$;
