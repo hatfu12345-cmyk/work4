@@ -1,9 +1,4 @@
-# legacy/docker-compose.yml
-# Старый (legacy) стек: Mattermost v9.5 + MySQL 8.0
-# Запуск: cd legacy && docker compose up -d   (имя проекта = имя папки = "legacy")
-#
-# Имена томов НЕ менять: на них ссылается docker-compose.prod.yml.
-# Пароли берутся из legacy/.env (шаблон — legacy/.env.example).
+
 services:
   mattermost:
     image: mattermost/mattermost-team-edition:9.5
