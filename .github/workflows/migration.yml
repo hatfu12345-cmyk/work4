@@ -69,7 +69,7 @@ jobs:
         id: check_status
         run: |
           FLAG="$HOME/.mattermost_migration_completed"
-          running() { docker ps --format '{{.Names}}' | grep -qx "$1"; }
+          running() { docker ps --format '{{.Names}}' | grep -x "$1" >/dev/null; }
 
           if [ -f "$FLAG" ]; then
             echo "✅ Database already migrated to PostgreSQL. Skipping backup and data transfer."
@@ -91,7 +91,7 @@ jobs:
       - name: Backup Legacy MySQL
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          if ! docker ps --format '{{.Names}}' | grep -qx mattermost-mysql; then
+          if ! docker ps --format '{{.Names}}' | grep -x mattermost-mysql >/dev/null; then
             echo "❌ Error: Legacy MySQL container is not running!"
             exit 1
           fi
@@ -110,11 +110,14 @@ jobs:
             mysqldump -uroot --single-transaction --routines --triggers mattermost \
             | gzip > "$BACKUP_FILE"
 
-          if [ ! -s "$BACKUP_FILE" ] || ! gzip -dc "$BACKUP_FILE" | grep -q "CREATE TABLE"; then
+          # grep -c читает поток до конца (grep -q обрывает его раньше, и с pipefail
+          # gzip падает с SIGPIPE — проверка ложно считала бэкап битым)
+          TABLES=$(gzip -dc "$BACKUP_FILE" | grep -c "CREATE TABLE" || true)
+          if [ ! -s "$BACKUP_FILE" ] || [ "${TABLES:-0}" -eq 0 ]; then
             echo "❌ Backup is empty or broken"
             exit 1
           fi
-          echo "✅ Backup saved: $BACKUP_FILE ($(du -h "$BACKUP_FILE" | cut -f1))"
+          echo "✅ Backup saved: $BACKUP_FILE ($(du -h "$BACKUP_FILE" | cut -f1), tables: $TABLES)"
 
       # 3. Подготовка MySQL к pgloader: образ pgloader не поддерживает
       #    caching_sha2_password (плагин по умолчанию в MySQL 8.0).
@@ -208,7 +211,7 @@ jobs:
               POSTS=$(docker exec mattermost-postgres psql -U mmuser -d mattermost -tAc \
                       "SELECT COUNT(*) FROM posts WHERE deleteat = 0")
               echo "ℹ️ Posts in PostgreSQL: $POSTS"
-              if docker ps --format '{{.Names}}' | grep -qx mattermost-mysql; then
+              if docker ps --format '{{.Names}}' | grep -x mattermost-mysql >/dev/null; then
                 echo "❌ Legacy MySQL container is still running"
                 exit 1
               fi
