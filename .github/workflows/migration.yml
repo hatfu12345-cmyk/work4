@@ -34,8 +34,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Windows-раннер: Docker Desktop может не попасть в PATH процесса раннера.
+      # Добавляем папку с docker.exe в PATH для всех следующих шагов.
+      - name: Add Docker to PATH
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            echo 'C:\Program Files\Docker\Docker\resources\bin' >> "$GITHUB_PATH"
+            echo "➕ Docker Desktop bin added to PATH"
+          fi
+
       - name: Check secrets are configured
         run: |
+          docker --version
+          docker compose version
           if [ -z "$POSTGRES_PASSWORD" ] || [ -z "$MYSQL_ROOT_PASSWORD" ]; then
             echo "❌ Secrets DB_POSTGRES_PASSWORD / DB_MYSQL_ROOT_PASSWORD are not set"
             exit 1
