@@ -38,10 +38,19 @@ jobs:
       # Добавляем папку с docker.exe в PATH для всех следующих шагов.
       - name: Add Docker to PATH
         run: |
-          if ! command -v docker >/dev/null 2>&1; then
-            echo 'C:\Program Files\Docker\Docker\resources\bin' >> "$GITHUB_PATH"
-            echo "➕ Docker Desktop bin added to PATH"
+          if command -v docker >/dev/null 2>&1; then
+            echo "✅ docker already in PATH"; exit 0
           fi
+          # Docker Desktop ставится либо для всех пользователей, либо в профиль пользователя
+          for DIR in "$LOCALAPPDATA\\Programs\\DockerDesktop\\resources\\bin" \
+                     'C:\Program Files\Docker\Docker\resources\bin'; do
+            if [ -f "$DIR\\docker.exe" ]; then
+              echo "$DIR" >> "$GITHUB_PATH"
+              echo "➕ Added to PATH: $DIR"
+              exit 0
+            fi
+          done
+          echo "❌ docker.exe not found"; exit 1
 
       - name: Check secrets are configured
         run: |
